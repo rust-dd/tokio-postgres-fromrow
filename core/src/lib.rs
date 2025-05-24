@@ -1,6 +1,6 @@
 use darling::{Error, FromDeriveInput, FromField, ast};
 use proc_macro::TokenStream;
-use quote::ToTokens;
+use quote::{ToTokens, quote};
 use syn::{DeriveInput, parse_macro_input};
 
 #[proc_macro_derive(FromRow)]
@@ -45,7 +45,41 @@ impl DeriveFromRow {
             f.validate()?;
         }
 
-        Ok(TokenStream::new())
+        let ident = &self.ident;
+        let (impl_generics, ty_generics, where_clause) = self.generics.split_for_impl();
+        let original_predicates = where_clause.clone().map(|w| &w.predicates).into_iter();
+        let mut predicates = Vec::new();
+
+        for f in fields {
+            f.add_predicates(&mut predicates)?;
+        }
+
+        let from_row_fields = fields
+            .iter()
+            .map(|f| f.generate_from_row())
+            .collect::<syn::Result<Vec<_>>>()?;
+        let try_from_row_fields = fields
+            .iter()
+            .map(|f| f.generate_try_from_row())
+            .collect::<syn::Result<Vec<_>>>()?;
+
+        let quote = quote! {
+            impl #impl_generics tokio_postgres_fromrow::FromRow for #ident #ty_generics where #(#original_predicates),* #(#predicates),* {
+                fn from_row(row: &tokio_postgres_fromrow::tokio_postgres::Row) -> Self {
+                    Self {
+                        #(#from_row_fields),*
+                    }
+                }
+
+                fn try_from_row(row: &tokio_postgres_fromrow::tokio_postgres::Row) -> Result<Self, tokio_postgres_fromrow::tokio_postgres::Error> {
+                    Ok(Self {
+                        #(#try_from_row_fields),*
+                    })
+                }
+            }
+        };
+
+        Ok(quote.into())
     }
 }
 
@@ -58,6 +92,7 @@ struct FromRowField {
     from: Option<String>,
     try_from: Option<String>,
     raname: Option<String>,
+    attrs: Vec<syn::Attribute>,
 }
 
 impl FromRowField {
@@ -89,5 +124,63 @@ impl FromRowField {
             .as_ref()
             .map(Clone::clone)
             .unwrap_or(self.ident.as_ref().unwrap().to_string())
+    }
+
+    /// Add predicates
+    fn add_predicates(&self, predicates: &mut Vec<proc_macro2::TokenStream>) -> syn::Result<()> {
+        let ty = &self.ty;
+        let target_ty = self.target_field_ty()?;
+
+        predicates.push(
+            quote!(#target_ty: for<'__from_row> tokio_postgres_fromrow::tokio_postgres::types::FromSql<'__from_row>),
+        );
+
+        if self.from.is_some() {
+            predicates.push(quote!(#ty: std::convert::From<#target_ty>));
+        }
+
+        if self.try_from.is_some() {
+            let try_from = quote!(std::convert::TryFrom<#target_ty>);
+
+            predicates.push(quote!(#ty: #try_from));
+            predicates.push(quote!(tokio_postgres_fromrow::Error: std::convert::From<<#ty as #try_from>::Error>));
+            predicates.push(quote!(<#ty as #try_from>::Error: std::fmt::Debug));
+        }
+
+        Ok(())
+    }
+
+    fn generate_from_row(&self) -> syn::Result<proc_macro2::TokenStream> {
+        let ident = self.ident.as_ref().unwrap();
+        let vis = &self.vis;
+        let col_name = self.target_field_name();
+        let ty = &self.ty;
+        let target_ty = self.target_field_ty()?;
+        let attrs = &self.attrs;
+
+        let field_expr = quote!(tokio_postgres_fromrow::tokio_postgres::Row::get::<&str, #target_ty>(row, #col_name));
+
+        // add from, try_from
+
+        Ok(quote! {
+            #(#attrs)*
+            #vis #ident: #field_expr,
+        })
+    }
+
+    fn generate_try_from_row(&self) -> syn::Result<proc_macro2::TokenStream> {
+        let ident = self.ident.as_ref().unwrap();
+        let vis = &self.vis;
+        let col_name = self.target_field_name();
+        let ty = &self.ty;
+        let target_ty = self.target_field_ty()?;
+        let attrs = &self.attrs;
+
+        let field_expr = quote!(tokio_postgres_fromrow::tokio_postgres::Row::get::<&str, #target_ty>(row, #col_name));
+
+        Ok(quote! {
+            #(#attrs)*
+            #vis #ident: #field_expr,
+        })
     }
 }
